@@ -1,0 +1,15 @@
+name: Build ZOSI ZG2332M firmware
+
+on:
+  push:
+    branches: [zosi-zg2332m]
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-one.yml
+    with:
+      platform: hi3516ev100_lite
+    permissions:
+      contents: write
+    secrets: inherit
