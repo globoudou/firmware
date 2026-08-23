@@ -1,0 +1,30 @@
+name: Rebase camera branch on upstream
+
+on:
+  workflow_run:
+    workflows: ["Sync upstream"]
+    types: [completed]
+  workflow_dispatch:
+
+jobs:
+  rebase:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: zosi-zg2332m
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Rebase on master
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin master
+          git rebase origin/master
+          git push origin zosi-zg2332m --force-with-lease
+      - name: Notify on conflict
+        if: failure()
+        run: echo "::error::Conflit de rebase sur zosi-zg2332m - intervention manuelle requise"
