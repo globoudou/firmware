@@ -2,14 +2,82 @@ name: Build ZOSI ZG2332M firmware
 
 on:
   push:
-    branches: [zosi-zg2332m]
+    branches:
+      - zosi-zg2332m
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
-    uses: ./.github/workflows/build-one.yml
-    with:
-      platform: hi3516ev100_lite
-    permissions:
-      contents: write
-    secrets: inherit
+    name: Firmware (hi3516ev100_lite)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: zosi-zg2332m
+
+      - name: Prepare firmware
+        run: |
+          echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
+          echo CACHE_DATE=$(date +%m) >> ${GITHUB_ENV}
+
+      - name: Setup ccache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ccache
+          key: hi3516ev100_lite-${{env.CACHE_DATE}}
+
+      - name: Setup dl cache
+        uses: actions/cache@v4
+        with:
+          path: output/dl
+          key: dl-${{env.CACHE_DATE}}
+          restore-keys: dl-
+
+      - name: Refresh moving-ref package downloads
+        run: |
+          find output/dl -type f -regextype posix-extended \
+            -regex '.*[-.](HEAD|master|main|dist)\.tar\.(gz|bz2|xz)' \
+            -print -delete 2>/dev/null || true
+
+      - name: Build firmware
+        run: |
+          export GIT_HASH=$(git rev-parse --short ${GITHUB_SHA})
+          export GIT_BRANCH=${GITHUB_REF_NAME}
+          echo GIT_HASH=${GIT_HASH} >> ${GITHUB_ENV}
+          echo GIT_BRANCH=${GIT_BRANCH} >> ${GITHUB_ENV}
+
+          mkdir -p /tmp/ccache
+          ln -s /tmp/ccache ${HOME}/.ccache
+
+          backoffs="30 60 120 300 600 1200"
+          attempt=1
+          for sleep_for in $backoffs ""; do
+            make BOARD=hi3516ev100_lite && break
+            if [ -z "$sleep_for" ]; then
+              echo "::error::build failed after ${attempt} attempts"
+              exit 1
+            fi
+            echo "::warning::attempt ${attempt} failed, retrying after ${sleep_for}s"
+            sleep "$sleep_for"
+            attempt=$((attempt + 1))
+          done
+
+          NORFW=$(find output/images -name openipc*nor*)
+          [ -e "${NORFW}" ] && echo NORFW=${NORFW} >> ${GITHUB_ENV}
+
+      - name: Upload firmware
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: zosi-zg2332m-${{ github.run_number }}
+          prerelease: false
+          make_latest: true
+          body: |
+            ZOSI ZG2332M - hi3516ev100_lite
+            sha=${{ github.sha }}
+            branch=zosi-zg2332m
+          files: ${{env.NORFW}}
