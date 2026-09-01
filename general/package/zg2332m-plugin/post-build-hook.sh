@@ -11,8 +11,10 @@ TARGET_DIR="${1:-}"
 
 SO="$TARGET_DIR/usr/lib/hisilicon.so"
 CONF="$TARGET_DIR/etc/majestic-ae.conf"
+GUARD="$TARGET_DIR/usr/sbin/ae-guard"
+GUARD_INIT="$TARGET_DIR/etc/init.d/S96ae-guard"
 
-if [ ! -f "$SO" ] || [ ! -f "$CONF" ]; then
+if [ ! -f "$SO" ] || [ ! -f "$CONF" ] || [ ! -f "$GUARD" ]; then
     echo "post-build-hook.sh: plugin artefacts missing under $TARGET_DIR, skipping"
     exit 0
 fi
@@ -25,8 +27,10 @@ STAGE="$(mktemp -d)"
 PKGDIR="$STAGE/zg2332m-plugin-$VER"
 mkdir -p "$PKGDIR"
 
-cp "$SO"   "$PKGDIR/hisilicon.so"
-cp "$CONF" "$PKGDIR/majestic-ae.conf"
+cp "$SO"    "$PKGDIR/hisilicon.so"
+cp "$CONF"  "$PKGDIR/majestic-ae.conf"
+cp "$GUARD" "$PKGDIR/ae-guard"
+cp "$GUARD_INIT" "$PKGDIR/S96ae-guard"
 
 cat > "$PKGDIR/install.sh" <<'EOF'
 #!/bin/sh
@@ -44,11 +48,14 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 }
 
 if [ "${PERSIST:-0}" = "1" ]; then
-    cp "$HERE/hisilicon.so"    /usr/lib/hisilicon.so
+    cp "$HERE/hisilicon.so"     /usr/lib/hisilicon.so
     cp "$HERE/majestic-ae.conf" /etc/majestic-ae.conf
+    cp "$HERE/ae-guard"         /usr/sbin/ae-guard
+    cp "$HERE/S96ae-guard"      /etc/init.d/S96ae-guard
+    chmod 755 /usr/sbin/ae-guard /etc/init.d/S96ae-guard
     grep -q '^plugins: true' /etc/majestic.yaml 2>/dev/null || \
         echo 'plugins: true' >> /etc/majestic.yaml
-    echo "installed persistently in /usr/lib and /etc"
+    echo "installed persistently in /usr/lib, /usr/sbin, /etc"
 else
     # RAM install via bind-mount (does not touch the overlay)
     mkdir -p /tmp/usrlib
@@ -68,7 +75,9 @@ fi
 
 /etc/init.d/S95majestic restart
 sleep 5
+[ -x /etc/init.d/S96ae-guard ] && /etc/init.d/S96ae-guard restart
 echo "plugin commands: $(echo help | nc -w 3 localhost 4000 | head -1)"
+echo "AE ranges     : $(echo gainmax | nc -w 3 localhost 4000 | head -1)"
 EOF
 chmod +x "$PKGDIR/install.sh"
 
@@ -81,7 +90,17 @@ Plugin AE Majestic pour Zosi ZG2332M (Hi3516EV100 + SC2235P).
 
 - \`hisilicon.so\` — binaire à installer en \`/usr/lib/hisilicon.so\`
 - \`majestic-ae.conf\` — config INI à installer en \`/etc/majestic-ae.conf\`
+- \`ae-guard\` + \`S96ae-guard\` — garde-fou et son script d'init
 - \`install.sh\` — script d'installation (RAM par défaut, PERSIST=1 pour l'overlay)
+
+## Pourquoi le garde-fou
+
+Majestic réapplique ses propres attributs d'exposition à chaque rechargement
+de configuration (bascule jour/nuit, \`/api/v1/config/set\`, …), ce qui efface le
+plafond de gain analogique. Sans ce plafond l'AE atteint AGain 15872, cran pour
+lequel le driver SC2235P écrit 0xff dans le registre capteur 0x3301 : l'image se
+remplit alors de traits verticaux. \`ae-guard\` détecte la dérive toutes les 6 s
+et réapplique le profil.
 
 ## Installation
 
@@ -101,8 +120,7 @@ Sur la caméra (SSH root):
 
 Accessibles via \`echo <cmd> | nc localhost 4000\`.
 
-- **AE** : \`gainmax\`, \`expmax\`, \`profile\`, \`stockae\`, \`expinfo\`, \`route\`, \`fpn\`
-- **Image** : \`blackwhite\`, \`brightness\`, \`contrast\`, \`rotation\`, \`version\`
+\`gainmax\`, \`expmax\`, \`profile\`, \`stockae\`, \`expinfo\`, \`route\`, \`fpn\`, \`help\`
 
 Voir \`majestic-ae.conf\` pour l'édition des profils AE.
 EOF

@@ -1,0 +1,24 @@
+#!/bin/sh
+DAEMON=/usr/sbin/ae-guard
+PIDFILE=/var/run/ae-guard.pid
+
+case "$1" in
+	start)
+		printf 'Starting ae-guard: '
+		start-stop-daemon -b -m -S -q -p $PIDFILE -x $DAEMON && echo OK || echo FAIL
+		;;
+	stop)
+		printf 'Stopping ae-guard: '
+		start-stop-daemon -K -q -p $PIDFILE && echo OK || echo FAIL
+		rm -f $PIDFILE
+		;;
+	restart|reload)
+		"$0" stop
+		sleep 1
+		"$0" start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac

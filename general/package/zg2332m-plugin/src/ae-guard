@@ -1,0 +1,56 @@
+#!/bin/sh
+# ae-guard — maintient le profil AE du plugin zg2332m.
+#
+# Majestic reapplique ses propres attributs d'exposition a chaque rechargement
+# de configuration (bascule jour/nuit, /api/v1/config/set, ...). Le plafond de
+# gain analogique saute alors a 15872, valeur pour laquelle le driver SC2235P
+# ecrit 0xff dans le registre capteur 0x3301 : l'image se remplit de traits
+# verticaux. Ce garde-fou detecte la derive et reapplique le profil.
+
+CONF=/etc/majestic-ae.conf
+PORT=4000
+INTERVAL="${INTERVAL:-6}"
+REGCHECK_EVERY=5      # sonde le registre capteur 1 passe sur 5
+SENSOR_ADDR=0x30
+
+want_again() {
+	awk '
+		/^[ \t]*\[/ { sec = $0; next }
+		sec == "[AE_Plugin]" && /^[ \t]*MaxAGain[ \t]*=/ {
+			sub(/^[^=]*=[ \t]*/, ""); sub(/[ \t;].*$/, ""); print; exit
+		}
+	' "$CONF" 2>/dev/null
+}
+
+live_again() {
+	echo gainmax | nc -w 3 localhost $PORT 2>/dev/null |
+		sed -n 's/.*AGain\[[0-9]*\.\.\([0-9]*\)\].*/\1/p'
+}
+
+reg3301() {
+	i2ctransfer -y -f 0 w2@$SENSOR_ADDR 0x33 0x01 r1 2>/dev/null
+}
+
+WANT="$(want_again)"
+[ -n "$WANT" ] || WANT=15360
+
+logger -t ae-guard "start: cible MaxAGain=$WANT, intervalle ${INTERVAL}s"
+
+N=0
+while : ; do
+	sleep "$INTERVAL"
+	N=$((N + 1))
+	LIVE="$(live_again)"
+	[ -n "$LIVE" ] || continue          # majestic absent / plugin pas encore charge
+
+	REASON=""
+	[ "$LIVE" != "$WANT" ] && REASON="MaxAGain=$LIVE (attendu $WANT)"
+	if [ -z "$REASON" ] && [ $((N % REGCHECK_EVERY)) -eq 0 ] && [ "$(reg3301)" = "0xff" ]; then
+		REASON="registre capteur 0x3301=0xff (traits verticaux)"
+	fi
+	[ -n "$REASON" ] || continue
+
+	echo "profile current" | nc -w 5 localhost $PORT >/dev/null 2>&1
+	sleep 3
+	logger -t ae-guard "profil reapplique — $REASON ; MaxAGain=$(live_again) 0x3301=$(reg3301)"
+done

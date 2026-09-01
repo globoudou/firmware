@@ -39,6 +39,15 @@ define ZG2332M_PLUGIN_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/usr/lib/hisilicon.so
 	$(INSTALL) -m 644 -D $(@D)/majestic-ae.conf \
 		$(TARGET_DIR)/etc/majestic-ae.conf
+	# Majestic re-applies its own exposure attributes on every config
+	# reload (day/night switch, /api/v1/config/set, ...), which wipes the
+	# analog-gain ceiling. Without that ceiling the SC2235P driver writes
+	# 0xff to sensor register 0x3301 and the frame fills with vertical
+	# stripes, so a watchdog puts the profile back.
+	$(INSTALL) -m 755 -D $(@D)/ae-guard \
+		$(TARGET_DIR)/usr/sbin/ae-guard
+	$(INSTALL) -m 755 -D $(@D)/S96ae-guard \
+		$(TARGET_DIR)/etc/init.d/S96ae-guard
 	# Enable plugin loading in the majestic config that the majestic
 	# package installed just before us.
 	if [ -f $(TARGET_DIR)/etc/majestic.yaml ] && \
