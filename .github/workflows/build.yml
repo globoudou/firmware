@@ -39,6 +39,14 @@ on:
         description: 'Run as the nightly release (skip when nothing changed)'
         type: boolean
         default: false
+      # Restrict the matrix to a single board defconfig name. Without it, a
+      # manual dispatch runs the full ~96-board matrix (workflow_dispatch is
+      # excluded from ci-matrix.py's PR-only narrowing). Empty = full matrix,
+      # as before.
+      platform:
+        description: 'Single board defconfig (e.g. hi3516ev100_lite). Empty = full matrix.'
+        type: string
+        default: ''
 
 # Cancel a PR's earlier run when a new commit lands on it. The matrix is ~96
 # jobs and there was no group here, so every push started another full matrix
@@ -80,7 +88,27 @@ jobs:
         name: Pick the affected boards
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 .github/scripts/ci-matrix.py
+          FORCE_PLATFORM: ${{ github.event.inputs.platform }}
+        run: |
+          set -euo pipefail
+          if [ -n "${FORCE_PLATFORM:-}" ]; then
+            echo "workflow_dispatch input platform='${FORCE_PLATFORM}' — overriding ci-matrix.py"
+            # Validate the board name against ALL_BOARDS so a typo fails here,
+            # not after 40 minutes of an empty matrix.
+            python3 -c "
+          import sys, importlib.util
+          spec = importlib.util.spec_from_file_location('ci_matrix', '.github/scripts/ci-matrix.py')
+          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          board = sys.argv[1]
+          if board not in m.ALL_BOARDS:
+              sys.stderr.write(f\"::error::platform '{board}' is not in ALL_BOARDS\n\")
+              sys.exit(2)
+          " "$FORCE_PLATFORM"
+            printf 'matrix={"include":[{"platform":"%s"}]}\n' "$FORCE_PLATFORM" >> "$GITHUB_OUTPUT"
+            printf 'needs-build=true\n' >> "$GITHUB_OUTPUT"
+          else
+            python3 .github/scripts/ci-matrix.py
+          fi
 
   preflight:
     name: Preflight
