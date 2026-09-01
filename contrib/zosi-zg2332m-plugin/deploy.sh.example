@@ -1,0 +1,54 @@
+#!/bin/bash
+# Example deploy script: RAM-only install (bind-mount).
+# The plugin binary and config are placed in /tmp and bind-mounted
+# over the read-only rootfs locations, so nothing is written to
+# the (saturated) jffs2 overlay. A reboot restores the original
+# state — this is intentional for now.
+#
+# Adapt the SCP/SSH mechanism to your setup: on OpenIPC the SSH
+# password differs per build (typically "toor" on this fork).
+#
+# Usage: CAM=192.168.13.200 ./deploy.sh
+set -euo pipefail
+: "${CAM:?}"
+
+HERE="$(dirname "$0")"
+BIN="$HERE/hisilicon.so"
+CONF="$HERE/majestic-ae.conf"
+
+# --- Push files (adapt to your ssh/scp mechanism) ---
+scp "$BIN"  "root@${CAM}:/tmp/hisilicon-v2.so"
+scp "$CONF" "root@${CAM}:/tmp/majestic-ae.conf"
+
+# --- Install (RAM-only, bind-mount) ---
+ssh "root@${CAM}" 'bash -s' <<'REMOTE'
+set -e
+# 1) bind-mount config file (if not already mounted)
+if ! mountpoint -q /etc/majestic-ae.conf; then
+    touch /etc/majestic-ae.conf 2>/dev/null || true
+    mount --bind /tmp/majestic-ae.conf /etc/majestic-ae.conf
+fi
+# 2) prepare a tmpfs mirror of /usr/lib so we can replace hisilicon.so
+#    without touching the read-only rootfs
+if ! mountpoint -q /usr/lib; then
+    mkdir -p /tmp/usrlib
+    # symlink every /rom/usr/lib entry into /tmp/usrlib
+    for f in /rom/usr/lib/*; do
+        ln -sf "$f" "/tmp/usrlib/$(basename "$f")"
+    done
+    mount --bind /tmp/usrlib /usr/lib
+fi
+# 3) install the plugin
+cp /tmp/hisilicon-v2.so /tmp/usrlib/hisilicon.so
+# 4) enable plugins in majestic.yaml if not already
+if ! grep -q '^plugins: true' /etc/majestic.yaml; then
+    echo 'plugins: true' >> /etc/majestic.yaml
+fi
+# 5) full restart (HUP is not enough — plugin dlclose is skipped)
+killall -9 majestic 2>/dev/null || true
+sleep 2
+nohup /usr/bin/majestic </dev/null >/dev/null 2>&1 &
+sleep 8
+echo help | nc -w 3 localhost 4000
+echo gainmax | nc -w 3 localhost 4000
+REMOTE
