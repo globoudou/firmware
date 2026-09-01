@@ -1,0 +1,18 @@
+config BR2_PACKAGE_ZG2332M_PLUGIN
+	bool "zg2332m-plugin"
+	depends on BR2_PACKAGE_HISILICON_OPENSDK
+	depends on BR2_arm
+	help
+	  Majestic AE plugin for the Zosi ZG2332M IP camera
+	  (Hi3516EV100 + SC2235P). Installs /usr/lib/hisilicon.so with:
+	    - a SysGain cap below the SC2235P column-FPN cliff at 15872,
+	      which is what produces the vertical stripes reported in
+	      low-light outdoor scenes after the day/night switch;
+	    - AE profiles loaded from /etc/majestic-ae.conf at plugin
+	      load so tuning can be adjusted without rebuilding.
+
+	  Built against the MPP headers of the hisilicon-opensdk package
+	  (openipc/openhisilicon), so it follows openipc upstream for the
+	  HiSilicon API surface. Does not build the upstream
+	  openipc/majestic-plugins hisilicon target, which requires
+	  cv500-family APIs not present on cv300.
