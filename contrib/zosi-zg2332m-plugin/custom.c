@@ -133,7 +133,12 @@ static int ini_get(const char *path, const char *want_sec, const char *want_key,
 
 static const char *ini_path(void)
 {
+	/* /tmp is preferred so a RAM-only deploy (bind-mount is not required
+	 * to create a new file target in the tight jffs2 overlay). Fall back
+	 * to /etc for a proper install, then to the sensor IQ file if it has
+	 * been extended with our sections. */
 	static const char *paths[] = {
+		"/tmp/majestic-ae.conf",
 		"/etc/majestic-ae.conf",
 		"/etc/sensors/iq/sc2235.ini",
 		NULL,
