@@ -18,6 +18,7 @@
  *   expinfo                            live exposure/gain
  *   route   [<t:g,...>|reload|clear]
  *   fpn     [on|off|calibrate]
+ *   sat     [0-255|auto|zero<iso>]     ISP saturation (0 = monochrome)
  *
  * Config: /etc/majestic-ae.conf, sections [AE_Plugin] and [AE_Plugin_<name>].
  * See the shipped majestic-ae.conf for the full key list.
@@ -26,6 +27,7 @@
  * the openhisilicon MPP headers via the hisilicon-opensdk package (openipc
  * upstream). plugin.c / plugin.h are shipped inline in this package's src/. */
 #include <mpi_ae.h>
+#include <mpi_awb.h>
 #include <mpi_isp.h>
 #include <plugin.h>
 
@@ -47,21 +49,31 @@ typedef struct {
 	HI_U8  tolerance;
 	HI_U8  speed;
 	HI_U8  slow_shutter;   /* 1 = AE_MODE_SLOW_SHUTTER, 0 = AE_MODE_FIX_FRAME_RATE */
+	HI_S16 saturation;     /* 0..255 manual, -1 = leave the ISP setting alone */
+	HI_U32 sat_zero_iso;   /* zero the auto saturation from this ISO up; 0 = off */
 } ae_profile;
 
-/* Internal fallback profile (matches the vendor night tuning). Only used
- * when neither the config file nor a named profile provides values. */
+#define SAT_UNSET (-1)
+
+static HI_S32 apply_saturation(HI_S16 manual, HI_U32 zero_iso);
+
+/* Internal fallback profile. Only used when neither the config file nor a
+ * named profile provides values, so it must be safe on its own: again_max
+ * stays one notch below 15872, the gain at which the SC2235P driver writes
+ * 0xff to sensor register 0x3301 and the frame fills with vertical stripes. */
 static const ae_profile fallback_night = {
-	.again_max    = 15872,
-	.dgain_max    = 1024,
-	.ispdgain_max = 4096,
-	.sysgain_max  = 61440,
-	.exptime_max  = 83000,
-	.gain_thresh  = 16384,
+	.again_max    = 15360,
+	.dgain_max    = 1024,   /* sensor digital gain is a no-op on this module */
+	.ispdgain_max = 8192,
+	.sysgain_max  = 122880, /* = again_max * ispdgain_max / 1024 */
+	.exptime_max  = 130000, /* hardware ceiling is 121215 us (4091 lines) */
+	.gain_thresh  = 16384,  /* keep low: exposure first, digital gain after */
 	.compensation = 52,
 	.tolerance    = 4,
 	.speed        = 64,
 	.slow_shutter = 1,
+	.saturation   = SAT_UNSET,
+	.sat_zero_iso = 3200,
 };
 
 /* -------- INI parsing -------- */
@@ -162,6 +174,13 @@ static int load_profile(const char *section, ae_profile *dst)
 		dst->slow_shutter = (strcasecmp(buf, "slow_shutter")==0 || strcasecmp(buf, "slowshutter")==0);
 		hit=1;
 	}
+	if (ini_get(path, section, "Saturation",   buf, sizeof buf)) {
+		/* "auto" (or anything non-numeric) leaves the ISP setting alone. */
+		dst->saturation = isdigit((unsigned char)buf[0])
+		                ? (HI_S16)(strtoul(buf,0,0) & 0xff) : SAT_UNSET;
+		hit=1;
+	}
+	if (ini_get(path, section, "SatZeroISO",   buf, sizeof buf)) { dst->sat_zero_iso = strtoul(buf,0,0); hit=1; }
 	return hit;
 }
 
@@ -187,7 +206,10 @@ static HI_S32 apply_profile(const ae_profile *p)
 	a.stAuto.u8Tolerance            = p->tolerance;
 	a.stAuto.u8Speed                = p->speed;
 	a.stAuto.enAEMode               = p->slow_shutter ? AE_MODE_SLOW_SHUTTER : AE_MODE_FIX_FRAME_RATE;
-	return HI_MPI_ISP_SetExposureAttr(ISP_DEV_ID, &a);
+	r = HI_MPI_ISP_SetExposureAttr(ISP_DEV_ID, &a);
+	if (r) return r;
+	/* Saturation is optional: a profile without either key leaves it alone. */
+	return apply_saturation(p->saturation, p->sat_zero_iso);
 }
 
 static HI_S32 apply_gainmax(HI_U32 max)
@@ -199,6 +221,60 @@ static HI_S32 apply_gainmax(HI_U32 max)
 	if (a.stAuto.stSysGainRange.u32Min > max)
 		a.stAuto.stSysGainRange.u32Min = 1024;
 	return HI_MPI_ISP_SetExposureAttr(ISP_DEV_ID, &a);
+}
+
+/* Saturation. At night the IR-cut filter is open, so the chroma the ISP
+ * recovers carries no real information and its noise dominates the picture.
+ * Dropping the saturation to 0 turns the stream monochrome and removes it.
+ *
+ * majestic has nightMode.colorToGray for this, but that path uses the
+ * cv500-only VENC_COLOR2GREY API and does nothing on cv300; going through
+ * majestic's own image.saturation works but costs a config reload, which
+ * wipes the AE profile. Setting the ISP attribute directly avoids both.
+ *
+ * Preferred form is `zero_iso`: the ISP already carries a per-ISO saturation
+ * table (au8Sat[i] applies at ISO 100 << i), so zeroing the entries at and
+ * above a given ISO makes the picture go monochrome exactly when the gain
+ * says it is night, and keeps daylight in colour — no day/night detection
+ * needed anywhere. `manual` is the blunt override: >= 0 forces that value at
+ * all times, < 0 (but not SAT_UNSET) restores OP_TYPE_AUTO. */
+static HI_U8 sat_base[ISP_AUTO_ISO_STRENGTH_NUM];
+static int   sat_base_valid;
+
+static HI_S32 apply_saturation(HI_S16 manual, HI_U32 zero_iso)
+{
+	if (manual == SAT_UNSET && zero_iso == 0) return HI_SUCCESS;
+
+	ISP_SATURATION_ATTR_S s;
+	HI_S32 r = HI_MPI_ISP_GetSaturationAttr(ISP_DEV_ID, &s);
+	if (r) return r;
+
+	/* Rebuild the table from the pristine one rather than from whatever we
+	 * left behind last time, otherwise zeroing is a one-way door: a later
+	 * call with a higher threshold could never bring the low-ISO entries
+	 * back. The snapshot is taken the first time we touch the attribute,
+	 * i.e. on the values majestic loaded from the IQ profile. */
+	if (!sat_base_valid) {
+		memcpy(sat_base, s.stAuto.au8Sat, sizeof sat_base);
+		sat_base_valid = 1;
+	}
+
+	if (zero_iso) {
+		for (int i = 0; i < ISP_AUTO_ISO_STRENGTH_NUM; i++)
+			s.stAuto.au8Sat[i] = ((100u << i) >= zero_iso) ? 0 : sat_base[i];
+		s.enOpType = OP_TYPE_AUTO;
+	}
+	if (manual != SAT_UNSET) {
+		if (manual < 0) {
+			/* Full restore: pristine table, automatic mode. */
+			memcpy(s.stAuto.au8Sat, sat_base, sizeof sat_base);
+			s.enOpType = OP_TYPE_AUTO;
+		} else {
+			s.enOpType = OP_TYPE_MANUAL;
+			s.stManual.u8Saturation = (HI_U8)manual;
+		}
+	}
+	return HI_MPI_ISP_SetSaturationAttr(ISP_DEV_ID, &s);
 }
 
 static HI_S32 apply_expmax(HI_U32 us)
@@ -451,6 +527,48 @@ static void cmd_fpn(const char *value)
 	RETURN("usage: fpn [on|off|calibrate [threshold]]");
 }
 
+static void cmd_sat(const char *value)
+{
+	ISP_SATURATION_ATTR_S s;
+
+	if (!strlen(value)) {
+		HI_S32 r = HI_MPI_ISP_GetSaturationAttr(ISP_DEV_ID, &s);
+		if (r) { RETURN("HI_MPI_ISP_GetSaturationAttr failed: 0x%x", r); }
+		/* au8Sat[i] applies at ISO 100 << i. */
+		RETURN("sat op=%s manual=%u auto[iso100,400,1600,6400,25600]=%u,%u,%u,%u,%u",
+		       s.enOpType == OP_TYPE_AUTO ? "auto" : "manual",
+		       s.stManual.u8Saturation,
+		       s.stAuto.au8Sat[0], s.stAuto.au8Sat[2],
+		       s.stAuto.au8Sat[4], s.stAuto.au8Sat[6],
+		       s.stAuto.au8Sat[8]);
+	}
+
+	/* "zero<iso>" rewrites the per-ISO table, a bare number or "auto"
+	 * drives the manual override. */
+	if (!strncasecmp(value, "zero", 4)) {
+		unsigned long iso = strtoul(value + 4, NULL, 0);
+		if (!iso) { RETURN("usage: sat zero<iso>   e.g. sat zero3200"); }
+		HI_S32 r = apply_saturation(SAT_UNSET, (HI_U32)iso);
+		if (r) { RETURN("HI_MPI_ISP_SetSaturationAttr failed: 0x%x", r); }
+		RETURN("sat: auto table zeroed from ISO %lu up", iso);
+	}
+
+	HI_S16 v;
+	if (!strcasecmp(value, "auto")) {
+		v = -1;
+	} else if (isdigit((unsigned char)value[0])) {
+		unsigned long n = strtoul(value, NULL, 0);
+		if (n > 255) { RETURN("sat: value out of range (0-255)"); }
+		v = (HI_S16)n;
+	} else {
+		RETURN("usage: sat [0-255|auto|zero<iso>]   (0 = monochrome, auto = restore)");
+	}
+
+	HI_S32 r = apply_saturation(v, 0);
+	if (r) { RETURN("HI_MPI_ISP_SetSaturationAttr failed: 0x%x", r); }
+	RETURN("sat %s", v < 0 ? "auto" : value);
+}
+
 /* -------- Boot -------- */
 
 __attribute__((constructor)) static void on_load(void)
@@ -491,6 +609,7 @@ static table custom[] = {
 	{ "expinfo", &cmd_expinfo },
 	{ "route",   &cmd_route   },
 	{ "fpn",     &cmd_fpn     },
+	{ "sat",     &cmd_sat     },
 	{ "help",    &get_usage   },
 };
 
