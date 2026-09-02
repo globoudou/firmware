@@ -19,6 +19,7 @@
  *   route   [<t:g,...>|reload|clear]
  *   fpn     [on|off|calibrate]
  *   sat     [0-255|auto|zero<iso>]     ISP saturation (0 = monochrome)
+ *   drc     [off|auto|<0-255>|dark<n>|limit<n>|reset]  local tone mapping
  *
  * Config: /etc/majestic-ae.conf, sections [AE_Plugin] and [AE_Plugin_<name>].
  * See the shipped majestic-ae.conf for the full key list.
@@ -51,11 +52,20 @@ typedef struct {
 	HI_U8  slow_shutter;   /* 1 = AE_MODE_SLOW_SHUTTER, 0 = AE_MODE_FIX_FRAME_RATE */
 	HI_S16 saturation;     /* 0..255 manual, -1 = leave the ISP setting alone */
 	HI_U32 sat_zero_iso;   /* zero the auto saturation from this ISO up; 0 = off */
+	HI_U8  drc_mode;       /* DRC_UNSET / DRC_OFF / DRC_AUTO / DRC_MANUAL */
+	HI_S16 drc_strength;   /* auto base or manual strength, -1 = leave */
+	HI_S16 drc_str_max;
+	HI_S16 drc_str_min;
+	HI_S16 drc_dark;       /* u8LocalMixingDark   [0..0x80], -1 = leave */
+	HI_S16 drc_dark_lmt;   /* u16DarkGainLmtY/C   [0..0x85], -1 = leave */
 } ae_profile;
 
 #define SAT_UNSET (-1)
 
+enum { DRC_UNSET = 0, DRC_OFF, DRC_AUTO, DRC_MANUAL };
+
 static HI_S32 apply_saturation(HI_S16 manual, HI_U32 zero_iso);
+static HI_S32 apply_drc(const ae_profile *p);
 
 /* Internal fallback profile. Only used when neither the config file nor a
  * named profile provides values, so it must be safe on its own: again_max
@@ -74,6 +84,12 @@ static const ae_profile fallback_night = {
 	.slow_shutter = 1,
 	.saturation   = SAT_UNSET,
 	.sat_zero_iso = 3200,
+	.drc_mode     = DRC_UNSET,
+	.drc_strength = -1,
+	.drc_str_max  = -1,
+	.drc_str_min  = -1,
+	.drc_dark     = -1,
+	.drc_dark_lmt = -1,
 };
 
 /* -------- INI parsing -------- */
@@ -181,6 +197,18 @@ static int load_profile(const char *section, ae_profile *dst)
 		hit=1;
 	}
 	if (ini_get(path, section, "SatZeroISO",   buf, sizeof buf)) { dst->sat_zero_iso = strtoul(buf,0,0); hit=1; }
+	if (ini_get(path, section, "DRC",          buf, sizeof buf)) {
+		dst->drc_mode = !strcasecmp(buf, "off")    ? DRC_OFF
+		              : !strcasecmp(buf, "auto")   ? DRC_AUTO
+		              : !strcasecmp(buf, "manual") ? DRC_MANUAL
+		              : DRC_UNSET;
+		hit=1;
+	}
+	if (ini_get(path, section, "DRCStrength",   buf, sizeof buf)) { dst->drc_strength = (HI_S16)strtoul(buf,0,0); hit=1; }
+	if (ini_get(path, section, "DRCStrengthMax",buf, sizeof buf)) { dst->drc_str_max  = (HI_S16)strtoul(buf,0,0); hit=1; }
+	if (ini_get(path, section, "DRCStrengthMin",buf, sizeof buf)) { dst->drc_str_min  = (HI_S16)strtoul(buf,0,0); hit=1; }
+	if (ini_get(path, section, "DRCDarkGain",   buf, sizeof buf)) { dst->drc_dark     = (HI_S16)strtoul(buf,0,0); hit=1; }
+	if (ini_get(path, section, "DRCDarkLimit",  buf, sizeof buf)) { dst->drc_dark_lmt = (HI_S16)strtoul(buf,0,0); hit=1; }
 	return hit;
 }
 
@@ -208,8 +236,11 @@ static HI_S32 apply_profile(const ae_profile *p)
 	a.stAuto.enAEMode               = p->slow_shutter ? AE_MODE_SLOW_SHUTTER : AE_MODE_FIX_FRAME_RATE;
 	r = HI_MPI_ISP_SetExposureAttr(ISP_DEV_ID, &a);
 	if (r) return r;
-	/* Saturation is optional: a profile without either key leaves it alone. */
-	return apply_saturation(p->saturation, p->sat_zero_iso);
+	/* Saturation and DRC are optional: a profile without the keys leaves
+	 * those modules alone. Neither failure should mask the AE result. */
+	r = apply_saturation(p->saturation, p->sat_zero_iso);
+	if (r) return r;
+	return apply_drc(p);
 }
 
 static HI_S32 apply_gainmax(HI_U32 max)
@@ -275,6 +306,79 @@ static HI_S32 apply_saturation(HI_S16 manual, HI_U32 zero_iso)
 		}
 	}
 	return HI_MPI_ISP_SetSaturationAttr(ISP_DEV_ID, &s);
+}
+
+/* DRC (local tone mapping). The ISP ships it DISABLED on this camera —
+ * /proc/umap/isp reports "DRC INFO En=0" on every unit — even though the IQ
+ * profile carries a [drc] section with bLinearDrcEnable=1, so majestic never
+ * turns the module on and editing that section changes nothing.
+ *
+ * It is the one lever that lifts the shadows without amplifying linearly the
+ * way the ISP digital gain does: it applies a differential gain, larger in
+ * the dark areas than in the bright ones, so highlights keep their headroom.
+ *
+ * Everything is optional. A profile with no DRC* key leaves the module
+ * exactly as it is; individual -1 fields keep whatever the ISP already had. */
+/* Snapshot of the tunables as the ISP had them before we first touched the
+ * module, so `drc reset` can put them back. Same reasoning as the saturation
+ * table: writing a gain limit is otherwise a one-way door, and the limits
+ * matter — in auto mode the firmware derives better ones on its own than
+ * anything we can force, so getting back to "untouched" has to be possible. */
+static struct {
+	int valid;
+	HI_BOOL en;
+	ISP_OP_TYPE_E op;
+	HI_U8  dark, auto_s, auto_max, auto_min, man_s;
+	HI_U16 lmt_y, lmt_c, lmt_b;
+} drc_base;
+
+static void drc_snapshot(const ISP_DRC_ATTR_S *d)
+{
+	if (drc_base.valid) return;
+	drc_base.en       = d->bEnable;
+	drc_base.op       = d->enOpType;
+	drc_base.dark     = d->u8LocalMixingDark;
+	drc_base.auto_s   = d->stAuto.u8Strength;
+	drc_base.auto_max = d->stAuto.u8StrengthMax;
+	drc_base.auto_min = d->stAuto.u8StrengthMin;
+	drc_base.man_s    = d->stManual.u8Strength;
+	drc_base.lmt_y    = d->u16DarkGainLmtY;
+	drc_base.lmt_c    = d->u16DarkGainLmtC;
+	drc_base.lmt_b    = d->u16BrightGainLmt;
+	drc_base.valid    = 1;
+}
+
+static HI_S32 apply_drc(const ae_profile *p)
+{
+	if (p->drc_mode == DRC_UNSET && p->drc_strength < 0 &&
+	    p->drc_str_max < 0 && p->drc_str_min < 0 &&
+	    p->drc_dark < 0 && p->drc_dark_lmt < 0)
+		return HI_SUCCESS;
+
+	ISP_DRC_ATTR_S d;
+	HI_S32 r = HI_MPI_ISP_GetDRCAttr(ISP_DEV_ID, &d);
+	if (r) return r;
+	drc_snapshot(&d);
+
+	switch (p->drc_mode) {
+	case DRC_OFF:    d.bEnable = HI_FALSE; break;
+	case DRC_AUTO:   d.bEnable = HI_TRUE; d.enOpType = OP_TYPE_AUTO;   break;
+	case DRC_MANUAL: d.bEnable = HI_TRUE; d.enOpType = OP_TYPE_MANUAL; break;
+	default: break;
+	}
+
+	if (p->drc_strength >= 0) {
+		d.stAuto.u8Strength   = (HI_U8)p->drc_strength;
+		d.stManual.u8Strength = (HI_U8)p->drc_strength;
+	}
+	if (p->drc_str_max >= 0) d.stAuto.u8StrengthMax = (HI_U8)p->drc_str_max;
+	if (p->drc_str_min >= 0) d.stAuto.u8StrengthMin = (HI_U8)p->drc_str_min;
+	if (p->drc_dark >= 0)    d.u8LocalMixingDark    = (HI_U8)p->drc_dark;
+	if (p->drc_dark_lmt >= 0) {
+		d.u16DarkGainLmtY = (HI_U16)p->drc_dark_lmt;
+		d.u16DarkGainLmtC = (HI_U16)p->drc_dark_lmt;
+	}
+	return HI_MPI_ISP_SetDRCAttr(ISP_DEV_ID, &d);
 }
 
 static HI_S32 apply_expmax(HI_U32 us)
@@ -569,6 +673,81 @@ static void cmd_sat(const char *value)
 	RETURN("sat %s", v < 0 ? "auto" : value);
 }
 
+static void drc_report(void)
+{
+	ISP_DRC_ATTR_S d;
+	HI_S32 r = HI_MPI_ISP_GetDRCAttr(ISP_DEV_ID, &d);
+	if (r) { RETURN("HI_MPI_ISP_GetDRCAttr failed: 0x%x", r); }
+	RETURN("drc en=%u op=%s strength=%u auto[base=%u max=%u min=%u] "
+	       "darkGain=%u darkLmtY=%u darkLmtC=%u brightLmt=%u",
+	       d.bEnable,
+	       d.enOpType == OP_TYPE_AUTO ? "auto" : "manual",
+	       d.stManual.u8Strength,
+	       d.stAuto.u8Strength, d.stAuto.u8StrengthMax, d.stAuto.u8StrengthMin,
+	       d.u8LocalMixingDark, d.u16DarkGainLmtY, d.u16DarkGainLmtC,
+	       d.u16BrightGainLmt);
+}
+
+static void cmd_drc(const char *value)
+{
+	if (!strlen(value)) {
+		drc_report();
+		return;
+	}
+
+	/* Majestic hands the plugin only the first whitespace-delimited token,
+	 * so the sub-commands that carry a number glue it on: dark64, limit96. */
+	ae_profile p;
+	memset(&p, 0, sizeof p);
+	p.drc_mode = DRC_UNSET;
+	p.drc_strength = p.drc_str_max = p.drc_str_min = -1;
+	p.drc_dark = p.drc_dark_lmt = -1;
+
+	if (!strcasecmp(value, "reset")) {
+		if (!drc_base.valid) { RETURN("drc: nothing to reset, module untouched"); }
+		ISP_DRC_ATTR_S d;
+		HI_S32 gr = HI_MPI_ISP_GetDRCAttr(ISP_DEV_ID, &d);
+		if (gr) { RETURN("HI_MPI_ISP_GetDRCAttr failed: 0x%x", gr); }
+		d.bEnable              = drc_base.en;
+		d.enOpType             = drc_base.op;
+		d.u8LocalMixingDark    = drc_base.dark;
+		d.stAuto.u8Strength    = drc_base.auto_s;
+		d.stAuto.u8StrengthMax = drc_base.auto_max;
+		d.stAuto.u8StrengthMin = drc_base.auto_min;
+		d.stManual.u8Strength  = drc_base.man_s;
+		d.u16DarkGainLmtY      = drc_base.lmt_y;
+		d.u16DarkGainLmtC      = drc_base.lmt_c;
+		d.u16BrightGainLmt     = drc_base.lmt_b;
+		HI_S32 sr = HI_MPI_ISP_SetDRCAttr(ISP_DEV_ID, &d);
+		if (sr) { RETURN("HI_MPI_ISP_SetDRCAttr failed: 0x%x", sr); }
+		drc_report();
+		return;
+	}
+
+	if      (!strcasecmp(value, "off"))  p.drc_mode = DRC_OFF;
+	else if (!strcasecmp(value, "auto")) p.drc_mode = DRC_AUTO;
+	else if (!strncasecmp(value, "dark", 4)) {
+		unsigned long n = strtoul(value + 4, NULL, 0);
+		if (n > 0x80) { RETURN("drc: dark gain out of range (0-128)"); }
+		p.drc_dark = (HI_S16)n;
+	} else if (!strncasecmp(value, "limit", 5)) {
+		unsigned long n = strtoul(value + 5, NULL, 0);
+		if (n > 0x85) { RETURN("drc: dark limit out of range (0-133)"); }
+		p.drc_dark_lmt = (HI_S16)n;
+	} else if (isdigit((unsigned char)value[0])) {
+		unsigned long n = strtoul(value, NULL, 0);
+		if (n > 255) { RETURN("drc: strength out of range (0-255)"); }
+		p.drc_mode = DRC_MANUAL;
+		p.drc_strength = (HI_S16)n;
+	} else {
+		RETURN("usage: drc [off|auto|<0-255>|dark<0-128>|limit<0-133>|reset]");
+	}
+
+	HI_S32 r = apply_drc(&p);
+	if (r) { RETURN("HI_MPI_ISP_SetDRCAttr failed: 0x%x", r); }
+	drc_report();
+}
+
 /* -------- Boot -------- */
 
 __attribute__((constructor)) static void on_load(void)
@@ -610,6 +789,7 @@ static table custom[] = {
 	{ "route",   &cmd_route   },
 	{ "fpn",     &cmd_fpn     },
 	{ "sat",     &cmd_sat     },
+	{ "drc",     &cmd_drc     },
 	{ "help",    &get_usage   },
 };
 

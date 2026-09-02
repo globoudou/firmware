@@ -13,10 +13,11 @@ INTERVAL="${INTERVAL:-6}"
 REGCHECK_EVERY=5      # sonde le registre capteur 1 passe sur 5
 SENSOR_ADDR=0x30
 
-want_again() {
-	awk '
+# Valeur d'une cle de la section [AE_Plugin] du fichier de conf.
+conf_key() {
+	awk -v key="$1" '
 		/^[ \t]*\[/ { sec = $0; next }
-		sec == "[AE_Plugin]" && /^[ \t]*MaxAGain[ \t]*=/ {
+		sec == "[AE_Plugin]" && tolower($0) ~ "^[ \t]*" tolower(key) "[ \t]*=" {
 			sub(/^[^=]*=[ \t]*/, ""); sub(/[ \t;].*$/, ""); print; exit
 		}
 	' "$CONF" 2>/dev/null
@@ -27,14 +28,29 @@ live_again() {
 		sed -n 's/.*AGain\[[0-9]*\.\.\([0-9]*\)\].*/\1/p'
 }
 
+live_drc_en() {
+	echo drc | nc -w 3 localhost $PORT 2>/dev/null |
+		sed -n 's/^drc en=\([0-9]*\).*/\1/p'
+}
+
 reg3301() {
 	i2ctransfer -y -f 0 w2@$SENSOR_ADDR 0x33 0x01 r1 2>/dev/null
 }
 
-WANT="$(want_again)"
+WANT="$(conf_key MaxAGain)"
 [ -n "$WANT" ] || WANT=15360
 
-logger -t ae-guard "start: cible MaxAGain=$WANT, intervalle ${INTERVAL}s"
+# Majestic remet aussi le DRC a zero en rechargeant sa config. La conf dit ce
+# qu'on attend : absente -> on ne surveille pas, "off" -> desactive, sinon
+# actif.
+WANT_DRC=""
+case "$(conf_key DRC)" in
+	"")    WANT_DRC="" ;;
+	off)   WANT_DRC=0 ;;
+	*)     WANT_DRC=1 ;;
+esac
+
+logger -t ae-guard "start: cible MaxAGain=$WANT DRC=${WANT_DRC:-libre}, intervalle ${INTERVAL}s"
 
 N=0
 while : ; do
@@ -45,6 +61,11 @@ while : ; do
 
 	REASON=""
 	[ "$LIVE" != "$WANT" ] && REASON="MaxAGain=$LIVE (attendu $WANT)"
+	if [ -z "$REASON" ] && [ -n "$WANT_DRC" ]; then
+		DRC_EN="$(live_drc_en)"
+		[ -n "$DRC_EN" ] && [ "$DRC_EN" != "$WANT_DRC" ] &&
+			REASON="DRC en=$DRC_EN (attendu $WANT_DRC)"
+	fi
 	if [ -z "$REASON" ] && [ $((N % REGCHECK_EVERY)) -eq 0 ] && [ "$(reg3301)" = "0xff" ]; then
 		REASON="registre capteur 0x3301=0xff (traits verticaux)"
 	fi
@@ -52,5 +73,5 @@ while : ; do
 
 	echo "profile current" | nc -w 5 localhost $PORT >/dev/null 2>&1
 	sleep 3
-	logger -t ae-guard "profil reapplique — $REASON ; MaxAGain=$(live_again) 0x3301=$(reg3301)"
+	logger -t ae-guard "profil reapplique — $REASON ; MaxAGain=$(live_again) DRC=$(live_drc_en) 0x3301=$(reg3301)"
 done
