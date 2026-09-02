@@ -37,6 +37,40 @@ reg3301() {
 	i2ctransfer -y -f 0 w2@$SENSOR_ADDR 0x33 0x01 r1 2>/dev/null
 }
 
+# Saturation pilotee par la position du filtre IR-cut.
+#
+# Le plugin sait deja couper la chroma au-dessus d'un ISO (SatZeroISO), mais
+# l'ISO est un mauvais indicateur quand l'illuminateur IR est efficace : une
+# camera d'interieur bien eclairee en IR tourne a ISO 600-1400, tres en dessous
+# du seuil, alors que son IR-cut est ouvert et que la couleur qu'elle produit
+# est fausse (dominante rose, chroma mesuree a 44-51 contre 3 en plein jour).
+#
+# Le capteur de lumiere, lui, donne directement l'etat : 1 = nuit, IR-cut
+# ouvert, chroma sans signification. On s'en sert quand il existe ; sur les
+# cameras qui n'en exposent pas (lightMonitor:false), on laisse le repli ISO
+# du plugin faire le travail.
+LIGHT_SENSOR=/sys/class/gpio/gpio66/value
+[ -r "$LIGHT_SENSOR" ] || LIGHT_SENSOR=""
+
+enforce_sat() {
+	[ -n "$LIGHT_SENSOR" ] || return 0
+	night=$(cat "$LIGHT_SENSOR" 2>/dev/null)
+	live=$(echo sat | nc -w 3 localhost $PORT 2>/dev/null)
+	[ -n "$live" ] || return 0
+	case "$night" in
+	1)
+		case "$live" in *"op=manual manual=0 auto"*) return 0 ;; esac
+		echo "sat 0" | nc -w 5 localhost $PORT >/dev/null 2>&1
+		logger -t ae-guard "nuit (IR-cut ouvert) : saturation forcee a 0"
+		;;
+	0)
+		case "$live" in *"op=auto"*) return 0 ;; esac
+		echo "sat auto" | nc -w 5 localhost $PORT >/dev/null 2>&1
+		logger -t ae-guard "jour : saturation rendue a l automatique"
+		;;
+	esac
+}
+
 WANT="$(conf_key MaxAGain)"
 [ -n "$WANT" ] || WANT=15360
 
@@ -50,12 +84,22 @@ case "$(conf_key DRC)" in
 	*)     WANT_DRC=1 ;;
 esac
 
-logger -t ae-guard "start: cible MaxAGain=$WANT DRC=${WANT_DRC:-libre}, intervalle ${INTERVAL}s"
+logger -t ae-guard "start: cible MaxAGain=$WANT DRC=${WANT_DRC:-libre} capteur_lum=${LIGHT_SENSOR:-aucun}, intervalle ${INTERVAL}s"
 
+enforce_sat
+PREV_NIGHT="$([ -n "$LIGHT_SENSOR" ] && cat "$LIGHT_SENSOR" 2>/dev/null)"
 N=0
 while : ; do
 	sleep "$INTERVAL"
 	N=$((N + 1))
+	# Saturation : a chaque bascule du capteur de lumiere, et une passe sur 5
+	# en filet (une reapplication de profil remet la table auto en service).
+	NOW_NIGHT="$([ -n "$LIGHT_SENSOR" ] && cat "$LIGHT_SENSOR" 2>/dev/null)"
+	if [ "$NOW_NIGHT" != "$PREV_NIGHT" ] || [ $((N % 5)) -eq 0 ]; then
+		enforce_sat
+		PREV_NIGHT="$NOW_NIGHT"
+	fi
+
 	LIVE="$(live_again)"
 	[ -n "$LIVE" ] || continue          # majestic absent / plugin pas encore charge
 
@@ -73,5 +117,6 @@ while : ; do
 
 	echo "profile current" | nc -w 5 localhost $PORT >/dev/null 2>&1
 	sleep 3
+	enforce_sat                          # le profil vient de rearmer la table auto
 	logger -t ae-guard "profil reapplique — $REASON ; MaxAGain=$(live_again) DRC=$(live_drc_en) 0x3301=$(reg3301)"
 done
