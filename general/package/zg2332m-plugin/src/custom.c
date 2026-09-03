@@ -60,7 +60,13 @@ typedef struct {
 	HI_S16 drc_dark_lmt;   /* u16DarkGainLmtY/C   [0..0x85], -1 = leave */
 } ae_profile;
 
+/* Two distinct meanings, which must not share a value: SAT_UNSET means "leave
+ * the saturation attribute exactly as it is", SAT_AUTO means "put the pristine
+ * per-ISO table back and return to automatic mode". Collapsing both onto -1
+ * made `sat auto` hit the early return in apply_saturation and silently do
+ * nothing, which left cameras stuck in monochrome after a night. */
 #define SAT_UNSET (-1)
+#define SAT_AUTO  (-2)
 
 enum { DRC_UNSET = 0, DRC_OFF, DRC_AUTO, DRC_MANUAL };
 
@@ -268,7 +274,8 @@ static HI_S32 apply_gainmax(HI_U32 max)
  * above a given ISO makes the picture go monochrome exactly when the gain
  * says it is night, and keeps daylight in colour — no day/night detection
  * needed anywhere. `manual` is the blunt override: >= 0 forces that value at
- * all times, < 0 (but not SAT_UNSET) restores OP_TYPE_AUTO. */
+ * all times, SAT_AUTO restores the pristine table and automatic mode, and
+ * SAT_UNSET leaves the attribute alone. */
 static HI_U8 sat_base[ISP_AUTO_ISO_STRENGTH_NUM];
 static int   sat_base_valid;
 
@@ -295,15 +302,13 @@ static HI_S32 apply_saturation(HI_S16 manual, HI_U32 zero_iso)
 			s.stAuto.au8Sat[i] = ((100u << i) >= zero_iso) ? 0 : sat_base[i];
 		s.enOpType = OP_TYPE_AUTO;
 	}
-	if (manual != SAT_UNSET) {
-		if (manual < 0) {
-			/* Full restore: pristine table, automatic mode. */
-			memcpy(s.stAuto.au8Sat, sat_base, sizeof sat_base);
-			s.enOpType = OP_TYPE_AUTO;
-		} else {
-			s.enOpType = OP_TYPE_MANUAL;
-			s.stManual.u8Saturation = (HI_U8)manual;
-		}
+	if (manual == SAT_AUTO) {
+		/* Full restore: pristine table, automatic mode. */
+		memcpy(s.stAuto.au8Sat, sat_base, sizeof sat_base);
+		s.enOpType = OP_TYPE_AUTO;
+	} else if (manual != SAT_UNSET) {
+		s.enOpType = OP_TYPE_MANUAL;
+		s.stManual.u8Saturation = (HI_U8)manual;
 	}
 	return HI_MPI_ISP_SetSaturationAttr(ISP_DEV_ID, &s);
 }
@@ -659,7 +664,7 @@ static void cmd_sat(const char *value)
 
 	HI_S16 v;
 	if (!strcasecmp(value, "auto")) {
-		v = -1;
+		v = SAT_AUTO;
 	} else if (isdigit((unsigned char)value[0])) {
 		unsigned long n = strtoul(value, NULL, 0);
 		if (n > 255) { RETURN("sat: value out of range (0-255)"); }
