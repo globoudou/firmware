@@ -49,12 +49,28 @@ reg3301() {
 # ouvert, chroma sans signification. On s'en sert quand il existe ; sur les
 # cameras qui n'en exposent pas (lightMonitor:false), on laisse le repli ISO
 # du plugin faire le travail.
+#
+# Le chemin est re-teste A CHAQUE PASSE, pas une fois au demarrage : majestic
+# exporte gpio66 quelques secondes apres son lancement, et S96ae-guard part
+# avant. Une sonde unique au demarrage faisait croire au garde-fou, apres tout
+# redemarrage, qu'il n'y avait pas de capteur — il cessait alors silencieusement
+# de piloter la saturation jusqu'a un redemarrage manuel.
 LIGHT_SENSOR=/sys/class/gpio/gpio66/value
-[ -r "$LIGHT_SENSOR" ] || LIGHT_SENSOR=""
 
-enforce_sat() {
-	[ -n "$LIGHT_SENSOR" ] || return 0
-	night=$(cat "$LIGHT_SENSOR" 2>/dev/null)
+# Anti-rebond : le capteur oscille pres du seuil (observe sur une camera
+# d'interieur : deux bascules en 7 s). majestic debounce de son cote via
+# monitorDelay/dncDelay ; sans equivalent ici, l'image clignoterait entre
+# couleur et monochrome. On exige STABLE_N lectures identiques consecutives.
+STABLE_N=5
+
+read_night() {
+	[ -r "$LIGHT_SENSOR" ] || return 1
+	cat "$LIGHT_SENSOR" 2>/dev/null
+}
+
+enforce_sat() {           # $1 = 1 (nuit) ou 0 (jour)
+	night="$1"
+	[ -n "$night" ] || return 0
 	live=$(echo sat | nc -w 3 localhost $PORT 2>/dev/null)
 	[ -n "$live" ] || return 0
 	case "$night" in
@@ -84,20 +100,29 @@ case "$(conf_key DRC)" in
 	*)     WANT_DRC=1 ;;
 esac
 
-logger -t ae-guard "start: cible MaxAGain=$WANT DRC=${WANT_DRC:-libre} capteur_lum=${LIGHT_SENSOR:-aucun}, intervalle ${INTERVAL}s"
+logger -t ae-guard "start: cible MaxAGain=$WANT DRC=${WANT_DRC:-libre} capteur_lum=$LIGHT_SENSOR (sonde a chaque passe), intervalle ${INTERVAL}s"
 
-enforce_sat
-PREV_NIGHT="$([ -n "$LIGHT_SENSOR" ] && cat "$LIGHT_SENSOR" 2>/dev/null)"
+NIGHT_STATE=""      # etat retenu, apres anti-rebond
+CAND=""; CAND_N=0   # candidat en cours de confirmation
 N=0
 while : ; do
 	sleep "$INTERVAL"
 	N=$((N + 1))
-	# Saturation : a chaque bascule du capteur de lumiere, et une passe sur 5
-	# en filet (une reapplication de profil remet la table auto en service).
-	NOW_NIGHT="$([ -n "$LIGHT_SENSOR" ] && cat "$LIGHT_SENSOR" 2>/dev/null)"
-	if [ "$NOW_NIGHT" != "$PREV_NIGHT" ] || [ $((N % 5)) -eq 0 ]; then
-		enforce_sat
-		PREV_NIGHT="$NOW_NIGHT"
+	# Saturation : anti-rebond sur le capteur, puis application. Une passe
+	# sur 10 en filet, car une reapplication de profil remet la table auto
+	# en service et annulerait le monochrome de nuit.
+	if RAW="$(read_night)"; then
+		if [ "$RAW" = "$CAND" ]; then
+			CAND_N=$((CAND_N + 1))
+		else
+			CAND="$RAW"; CAND_N=1
+		fi
+		if [ "$CAND_N" -ge "$STABLE_N" ] && [ "$CAND" != "$NIGHT_STATE" ]; then
+			NIGHT_STATE="$CAND"
+			enforce_sat "$NIGHT_STATE"
+		elif [ -n "$NIGHT_STATE" ] && [ $((N % 10)) -eq 0 ]; then
+			enforce_sat "$NIGHT_STATE"
+		fi
 	fi
 
 	LIVE="$(live_again)"
@@ -117,6 +142,6 @@ while : ; do
 
 	echo "profile current" | nc -w 5 localhost $PORT >/dev/null 2>&1
 	sleep 3
-	enforce_sat                          # le profil vient de rearmer la table auto
+	enforce_sat "$NIGHT_STATE"           # le profil vient de rearmer la table auto
 	logger -t ae-guard "profil reapplique — $REASON ; MaxAGain=$(live_again) DRC=$(live_drc_en) 0x3301=$(reg3301)"
 done
